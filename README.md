@@ -19,6 +19,12 @@ A small CLI that launches a Docker-based sandbox environment for Claude tooling.
 happy-sandbox
 ```
 
+Or via Python module invocation:
+
+```
+python -m happy_sandbox
+```
+
 The tool executes the equivalent of:
 
 ```
@@ -40,4 +46,3 @@ If either `~/.claude/.credentials.json` or `~/.happy/access.key` is missing, the
 - Project uses `hatchling` (via `pyproject.toml`).
 - Dev tools: `black`, `mypy` (see `[tool.uv]` dev-dependencies).
 - MyPy is configured with the `pydantic` plugin.
-
