@@ -13,7 +13,7 @@ if [ -f /host/claude-md-combined ]; then
     cp /host/claude-md-combined /home/claude/.claude/CLAUDE.md
 fi
 
-cat > /home/claude/project.json <<FOO
+cat > /home/claude/project-settings.json <<FOO
 {
     "projects": {
         "/workspace/$PROJECT_NAME": {
@@ -38,7 +38,7 @@ mkdir -p "/workspace/$PROJECT_NAME"
 cd "/workspace/$PROJECT_NAME"
 
 cat /host/.claude.json | jq \
-    --slurpfile proj /home/claude/project.json \
+    --slurpfile proj /home/claude/project-settings.json \
     '{isQualifiedForDataSharing, hasCompletedOnboarding, oauthAccount, bypassPermissionsModeAccepted: true} + {projects: $proj[0]["projects"]}' \
     > /home/claude/.claude.json
 cp /host/.credentials.json /home/claude/.claude/.credentials.json
