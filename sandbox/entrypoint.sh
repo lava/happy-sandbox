@@ -8,6 +8,11 @@ PROJECT_NAME=${HAPPY_SANDBOX_PROJECT_NAME:-$(basename "$(pwd)")}
 
 mkdir -p /home/claude/.claude
 
+# Copy combined CLAUDE.md file if it exists
+if [ -f /host/claude-md-combined ]; then
+    cp /host/claude-md-combined /home/claude/.claude/CLAUDE.md
+fi
+
 cat > /home/claude/project.json <<FOO
 {
     "projects": {
@@ -34,7 +39,7 @@ cd "/workspace/$PROJECT_NAME"
 
 cat /host/.claude.json | jq \
     --slurpfile proj /home/claude/project.json \
-    '{isQualifiedForDataSharing, hasCompletedOnboarding, oauthAccount} + {projects: $proj[0]["projects"]}' \
+    '{isQualifiedForDataSharing, hasCompletedOnboarding, oauthAccount, bypassPermissionsModeAccepted: true} + {projects: $proj[0]["projects"]}' \
     > /home/claude/.claude.json
 cp /host/.credentials.json /home/claude/.claude/.credentials.json
 
