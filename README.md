@@ -1,6 +1,6 @@
 # happy-sandbox
 
-A small CLI that launches a Docker-based sandbox environment for Claude tooling.
+A simple docker-based sandbox environment for running a [happy](https://github.com/slopus/happy) client in.
 
 ## Installation
 
