@@ -9,6 +9,7 @@ description = "CLI to launch the Claude sandbox Docker environment"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+  "docopt>=0.6.2",
   "pydantic>=2.0.0",
   "pydantic-settings>=2.0.0",
 ]

@@ -1,12 +1,41 @@
+"""happy-sandbox
+
+Launch the happy sandbox container.
+
+Usage:
+    happy-sandbox [--shell] [--repo=<url>] [--append-system-prompt=<prompt>] [--mount=<mount>]...
+    happy-sandbox -h | --help
+    happy-sandbox --version
+
+Options:
+    -h --help                         Show this screen.
+    --version                         Show version.
+    --shell                           Start an interactive bash shell inside the sandbox instead of running happy.
+    --repo=<url>                      Git repository URL to clone inside the container (skips mounting local dir).
+    --append-system-prompt=<prompt>   System prompt to append (forwarded to happy --append-system-prompt).
+    --mount=<mount>                   Additional Docker mount options (can be specified multiple times).
+                                      Format: source:destination[:options] (e.g., /host/path:/container/path:ro)
+
+Environment Variables:
+    HAPPY_SANDBOX_PROJECT_NAME        Override project name
+    HAPPY_SANDBOX_WORKDIR             Override working directory
+    HAPPY_SANDBOX_IMAGE_NAME          Docker image name (default: happy-sandbox)
+    HAPPY_SANDBOX_SHELL               Start interactive shell (set to true/1)
+    HAPPY_SANDBOX_APPEND_SYSTEM_PROMPT  System prompt to append
+    HAPPY_SANDBOX_REPO_URL            Git repository URL to clone
+    HAPPY_SANDBOX_MOUNTS              Semicolon-separated mount options
+                                      (e.g., "/src1:/dst1;/src2:/dst2:ro")
+"""
+
 import os
 import sys
-import argparse
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import Field
+from docopt import docopt
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,38 +80,70 @@ def _collect_claude_md_files(home: Path, cwd: Path) -> str:
 
 
 class Settings(BaseSettings):
-    # Default project name: basename of current directory
-    project_name: str = Field(default_factory=lambda: Path.cwd().name)
-    # Workdir can be overridden via env; otherwise we derive from project_name
-    workdir: str = ""
-    image_name: str = "happy-sandbox"
-    append_system_prompt: Optional[str] = None
+    """Configuration settings for happy-sandbox.
+
+    All settings can be configured via environment variables with HAPPY_SANDBOX_ prefix
+    or overridden via CLI arguments.
+    """
+
+    # Core settings
+    project_name: str = Field(
+        default_factory=lambda: Path.cwd().name,
+        description="Project name, defaults to current directory name",
+    )
+    workdir: Optional[str] = Field(
+        default=None, description="Working directory in container"
+    )
+    image_name: str = Field(default="happy-sandbox", description="Docker image name")
+
+    # CLI options that can also be set via environment
+    shell: bool = Field(
+        default=False, description="Start interactive shell instead of happy"
+    )
+    repo_url: Optional[str] = Field(
+        default=None, description="Git repository URL to clone"
+    )
+    append_system_prompt: Optional[str] = Field(
+        default=None, description="System prompt to append"
+    )
+    mounts: List[str] = Field(
+        default_factory=list, description="Additional Docker mount options"
+    )
 
     # Load from environment with this prefix
     model_config = SettingsConfigDict(env_prefix="HAPPY_SANDBOX_")
 
+    @field_validator("mounts", mode="before")
+    @classmethod
+    def parse_mounts(cls, v):
+        """Parse mounts from string (environment) or list (CLI)."""
+        if isinstance(v, str):
+            # Parse semicolon-separated string from environment
+            return [m.strip() for m in v.split(";") if m.strip()]
+        elif v is None:
+            return []
+        return v
+
+    def merge_with_cli_args(self, args: dict) -> "Settings":
+        """Merge CLI arguments with settings, CLI takes precedence."""
+        # Create a dict of non-None CLI values
+        cli_overrides = {}
+
+        if args.get("--shell"):
+            cli_overrides["shell"] = True
+        if args.get("--repo"):
+            cli_overrides["repo_url"] = args["--repo"]
+        if args.get("--append-system-prompt"):
+            cli_overrides["append_system_prompt"] = args["--append-system-prompt"]
+        if args.get("--mount"):
+            cli_overrides["mounts"] = args["--mount"]
+
+        # Create new settings with CLI overrides
+        return self.model_copy(update=cli_overrides)
+
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        prog="happy-sandbox",
-        description="Launch the happy sandbox container",
-    )
-    parser.add_argument(
-        "--shell",
-        action="store_true",
-        help="Start an interactive bash shell inside the sandbox instead of running happy",
-    )
-    parser.add_argument(
-        "--repo",
-        type=str,
-        help="Git repository URL to clone inside the container (skips mounting local dir)",
-    )
-    parser.add_argument(
-        "--append-system-prompt",
-        type=str,
-        help="System prompt to append (forwarded to happy --append-system-prompt)",
-    )
-    args = parser.parse_args()
+    args = docopt(__doc__, version="happy-sandbox 0.1.0")
 
     home = Path.home()
     credentials = home / ".claude" / ".credentials.json"
@@ -92,25 +153,21 @@ def main() -> int:
         _print_auth_error()
         return 1
 
-    # Load configuration from environment via pydantic settings
+    # Load configuration from environment and merge with CLI args
     settings = Settings()
-    repo_url = args.repo if hasattr(args, "repo") and args.repo else None
-    append_system_prompt = (
-        args.append_system_prompt
-        if hasattr(args, "append_system_prompt") and args.append_system_prompt
-        else settings.append_system_prompt
-    )
-    if repo_url:
+    settings = settings.merge_with_cli_args(args)
+
+    # Determine project name and workdir
+    if settings.repo_url:
         # Extract project_name from repo URL
-        project_name = repo_url.split("/")[-1].replace(".git", "").replace(".GIT", "")
-        workdir = f"/workspace/{project_name}"
+        project_name = (
+            settings.repo_url.split("/")[-1].replace(".git", "").replace(".GIT", "")
+        )
+        workdir = settings.workdir or f"/workspace/{project_name}"
     else:
         project_name = settings.project_name
-        # Derive default workdir if not provided via env
-        if os.environ.get("HAPPY_SANDBOX_WORKDIR"):
-            workdir = settings.workdir
-        else:
-            workdir = f"/workspace/{project_name}"
+        workdir = settings.workdir or f"/workspace/{project_name}"
+
     image = settings.image_name
 
     # Collect CLAUDE.md files from outside pwd
@@ -134,8 +191,8 @@ def main() -> int:
         "-e",
         f"HAPPY_SANDBOX_PROJECT_NAME={project_name}",
     ]
-    if repo_url:
-        cmd.extend(["-e", f"HAPPY_SANDBOX_REPO_URL={repo_url}"])
+    if settings.repo_url:
+        cmd.extend(["-e", f"HAPPY_SANDBOX_REPO_URL={settings.repo_url}"])
     else:
         cmd.extend(
             [
@@ -143,8 +200,10 @@ def main() -> int:
                 f"{os.getcwd()}:{workdir}",
             ]
         )
-    if append_system_prompt:
-        cmd.extend(["-e", f"HAPPY_APPEND_SYSTEM_PROMPT={append_system_prompt}"])
+    if settings.append_system_prompt:
+        cmd.extend(
+            ["-e", f"HAPPY_APPEND_SYSTEM_PROMPT={settings.append_system_prompt}"]
+        )
     cmd.extend(
         [
             "-v",
@@ -160,6 +219,10 @@ def main() -> int:
     if claude_md_file:
         cmd.extend(["-v", f"{claude_md_file.name}:/host/claude-md-combined:ro"])
 
+    # Add any additional mount options specified by the user
+    for mount in settings.mounts:
+        cmd.extend(["-v", mount])
+
     cmd.extend(
         [
             "--network=host",
@@ -170,21 +233,21 @@ def main() -> int:
     )
 
     clone_script = ""
-    if repo_url:
+    if settings.repo_url:
         clone_script = f'git clone "$HAPPY_SANDBOX_REPO_URL" {workdir}; '
     cd_script = f"cd {workdir}; "
 
-    if args.shell:
+    if settings.shell:
         # Start an interactive shell within the sandbox container
         shell_cmd = clone_script + cd_script + "bash"
         cmd += ["bash", "-c", shell_cmd]
     else:
         # Default behavior: run happy inside the container
-        if append_system_prompt:
+        if settings.append_system_prompt:
             happy_cmd = (
                 clone_script
                 + cd_script
-                + f'happy --yolo --append-system-prompt "{append_system_prompt}"'
+                + f'happy --yolo --append-system-prompt "{settings.append_system_prompt}"'
             )
         else:
             happy_cmd = clone_script + cd_script + "happy --yolo"
