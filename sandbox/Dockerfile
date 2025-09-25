@@ -7,8 +7,18 @@ RUN apt-get update && \
   curl \
   zsh \
   git \
+  gpg \
+  wget \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+  apt-get update && \
+  apt-get install --no-install-recommends -y gh && \
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists/*
 
 RUN adduser claude
 
@@ -45,6 +55,8 @@ RUN \
   npm install -g @anthropic-ai/claude-code@latest && \
   # Install yarn globally
   npm install -g yarn && \
+  # Install codex CLI
+  npm install -g @openai/codex-cli && \
   # Clone and build happy-cli
   git clone https://github.com/lava/happy-cli.git /opt/happy && \
   cd /opt/happy && \
