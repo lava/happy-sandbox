@@ -3,7 +3,7 @@
 Launch the happy sandbox container.
 
 Usage:
-    happy-sandbox [--shell] [--repo=<url>] [--append-system-prompt=<prompt>] [--mount=<mount>]...
+    happy-sandbox [--shell] [--repo=<url>] [--append-system-prompt=<prompt>] [--mount=<mount>]... [--disable-daemon] [--disable-happy-mount] [-v | --verbose]
     happy-sandbox -h | --help
     happy-sandbox --version
 
@@ -15,6 +15,9 @@ Options:
     --append-system-prompt=<prompt>   System prompt to append (forwarded to happy --append-system-prompt).
     --mount=<mount>                   Additional Docker mount options (can be specified multiple times).
                                       Format: source:destination[:options] (e.g., /host/path:/container/path:ro)
+    --disable-daemon                  Disable happy daemon inside the sandbox.
+    --disable-happy-mount             Don't mount ~/.happy directory; use credentials.json instead.
+    -v --verbose                      Print the docker command being executed.
 
 Environment Variables:
     HAPPY_SANDBOX_PROJECT_NAME        Override project name
@@ -25,6 +28,9 @@ Environment Variables:
     HAPPY_SANDBOX_REPO_URL            Git repository URL to clone
     HAPPY_SANDBOX_MOUNTS              Semicolon-separated mount options
                                       (e.g., "/src1:/dst1;/src2:/dst2:ro")
+    HAPPY_SANDBOX_DISABLE_DAEMON      Disable happy daemon (set to true/1)
+    HAPPY_SANDBOX_DISABLE_HAPPY_MOUNT Don't mount ~/.happy directory (set to true/1)
+    HAPPY_DAEMON_CREDENTIALS_FILE     Path to happy daemon credentials file to mount
 """
 
 import os
@@ -109,6 +115,15 @@ class Settings(BaseSettings):
     mounts: List[str] = Field(
         default_factory=list, description="Additional Docker mount options"
     )
+    disable_daemon: bool = Field(
+        default=False, description="Disable happy daemon inside the sandbox"
+    )
+    disable_happy_mount: bool = Field(
+        default=False, description="Don't mount ~/.happy directory; use credentials.json instead"
+    )
+    verbose: bool = Field(
+        default=False, description="Print the docker command being executed"
+    )
 
     # Load from environment with this prefix
     model_config = SettingsConfigDict(env_prefix="HAPPY_SANDBOX_")
@@ -137,6 +152,12 @@ class Settings(BaseSettings):
             cli_overrides["append_system_prompt"] = args["--append-system-prompt"]
         if args.get("--mount"):
             cli_overrides["mounts"] = args["--mount"]
+        if args.get("--disable-daemon"):
+            cli_overrides["disable_daemon"] = True
+        if args.get("--disable-happy-mount"):
+            cli_overrides["disable_happy_mount"] = True
+        if args.get("--verbose"):
+            cli_overrides["verbose"] = True
 
         # Create new settings with CLI overrides
         return self.model_copy(update=cli_overrides)
@@ -149,7 +170,10 @@ def main() -> int:
     credentials = home / ".claude" / ".credentials.json"
     access_key = home / ".happy" / "access.key"
 
-    if not credentials.exists() or not access_key.exists():
+    # Check for daemon-provided credentials file
+    daemon_credentials_file = os.environ.get("HAPPY_DAEMON_CREDENTIALS_FILE")
+
+    if not (credentials.exists() or daemon_credentials_file) or not access_key.exists():
         _print_auth_error()
         return 1
 
@@ -204,16 +228,36 @@ def main() -> int:
         cmd.extend(
             ["-e", f"HAPPY_APPEND_SYSTEM_PROMPT={settings.append_system_prompt}"]
         )
+    if settings.disable_daemon:
+        cmd.extend(["-e", "HAPPY_DISABLE_DAEMON=true"])
     cmd.extend(
         [
             "-v",
             f"{home}/.claude.json:/host/.claude.json:ro",
-            "-v",
-            f"{home}/.claude/.credentials.json:/host/.credentials.json:ro",
-            "-v",
-            f"{home}/.happy:/home/claude/.happy",
         ]
     )
+
+    # Mount credentials files with clear naming
+    if daemon_credentials_file and Path(daemon_credentials_file).exists():
+        # Mount daemon-provided credentials file for Happy
+        cmd.extend([
+            "-v",
+            f"{daemon_credentials_file}:/host/happy-credentials.json:ro",
+        ])
+
+    # Always mount Claude credentials if they exist
+    if credentials.exists():
+        cmd.extend([
+            "-v",
+            f"{credentials}:/host/claude-credentials.json:ro",
+        ])
+
+    # Only mount ~/.happy directory if not disabled
+    if not settings.disable_happy_mount:
+        cmd.extend([
+            "-v",
+            f"{home}/.happy:/home/claude/.happy",
+        ])
 
     # Mount the combined CLAUDE.md file if we created one
     if claude_md_file:
@@ -252,6 +296,9 @@ def main() -> int:
         else:
             happy_cmd = clone_script + cd_script + "happy --yolo"
         cmd += ["bash", "-c", happy_cmd]
+
+    if settings.verbose:
+        print("Docker command:", " ".join(cmd), file=sys.stderr)
 
     try:
         result = subprocess.call(cmd)

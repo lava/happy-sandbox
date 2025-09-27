@@ -56,7 +56,7 @@ RUN \
   # Install yarn globally
   npm install -g yarn && \
   # Install codex CLI
-  npm install -g @openai/codex-cli && \
+  npm install -g @openai/codex && \
   # Clone and build happy-cli
   git clone https://github.com/lava/happy-cli.git /opt/happy && \
   cd /opt/happy && \

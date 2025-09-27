@@ -4,11 +4,13 @@ import asyncio
 import base64
 import json
 import os
+import pty
 import signal
 import platform
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -23,6 +25,7 @@ from happy_sandbox.credentials import (
     encrypt_machine_data_key_for_frontend,
 )
 from happy_sandbox.encryption import encrypt, decrypt
+from happy_sandbox.session_supervisor import SessionSupervisor
 
 
 def _get_project_version() -> str:
@@ -76,8 +79,8 @@ class SpawnSessionResult(BaseModel):
     """Result of spawning a Happy session."""
 
     type: str  # 'success', 'error', 'requestToApproveDirectoryCreation'
-    session_id: Optional[str] = None
-    error_message: Optional[str] = None
+    sessionId: Optional[str] = None
+    errorMessage: Optional[str] = None
     directory: Optional[str] = None
     message: Optional[str] = None
 
@@ -91,6 +94,7 @@ class TrackedSession(BaseModel):
     happy_session_metadata: Optional[Dict[str, Any]] = None
     directory_created: bool = False
     message: Optional[str] = None
+    credentials_file: Optional[str] = None  # Path to temporary credentials file
 
 
 class HappyDaemon:
@@ -122,6 +126,9 @@ class HappyDaemon:
         self.tracked_sessions: Dict[int, TrackedSession] = {}
         self.session_awaiters: Dict[int, Callable[[TrackedSession], None]] = {}
 
+        # Session supervisor for forwarding messages
+        self.session_supervisor: Optional[SessionSupervisor] = None
+
         # Setup socket event handlers
         self._setup_socket_handlers()
 
@@ -148,8 +155,8 @@ class HappyDaemon:
         async def connect_error(data):
             print(f"Connection error: {data}")
 
-        @self.sio.event
-        async def rpc_request(data: Dict[str, Any], callback: Callable):
+        @self.sio.on('rpc-request')
+        async def rpc_request(data: Dict[str, Any]):
             """Handle RPC requests from the server."""
             print("received rpc request")
             method = data.get("method", "")
@@ -160,11 +167,9 @@ class HappyDaemon:
                 params = self._decrypt_params(params_encrypted)
                 if params is None:
                     print(f"Failed to decrypt params for method: {method}")
-                    response = self._encrypt_response(
+                    return self._encrypt_response(
                         {"error": "Failed to decrypt request parameters"}
                     )
-                    await callback(response)
-                    return
 
                 print(f"Received RPC request: {method}")
 
@@ -179,17 +184,16 @@ class HappyDaemon:
                         {"error": f"Unknown method: {method}"}
                     )
 
-                await callback(response)
+                return response
             except Exception as e:
-                error_response = self._encrypt_response({"error": str(e)})
-                await callback(error_response)
+                return self._encrypt_response({"error": str(e)})
 
         @self.sio.event
         async def update(data: Dict[str, Any]):
             """Handle update events from server."""
             print(f"Received update event: {data.get('body', {}).get('t', 'unknown')}")
 
-        @self.sio.event
+        @self.sio.on("rpc-registered")
         async def rpc_registered(data: Dict[str, Any]):
             """Handle update events from server."""
             print(f"rpc registered")
@@ -352,6 +356,18 @@ class HappyDaemon:
         # Update daemon state to running (like happy-cli does)
         await self._update_daemon_state()
 
+        # Initialize session supervisor
+        if self.session_supervisor is None:
+            self.session_supervisor = SessionSupervisor(
+                server_url=self.server_url,
+                machine_id=self.machine_id,
+                encryption_key=self.encryption_key,
+                token=self.token,
+                encryption_variant=self.encryption_variant,
+            )
+            await self.session_supervisor.start()
+            print("Session supervisor started")
+
         # Then register RPC handlers via socket
         machine_methods = [
             f"{self.machine_id}:spawn-happy-session",
@@ -390,6 +406,18 @@ class HappyDaemon:
         """Spawn a new Happy session."""
         print(f"Spawning session in directory: {options.directory}")
 
+        # Check if Claude credentials exist - required for Claude sessions
+        if options.agent == "claude":
+            claude_credentials_path = Path.home() / ".claude" / ".credentials.json"
+            if not claude_credentials_path.exists():
+                return SpawnSessionResult(
+                    type="error",
+                    errorMessage=(
+                        "Claude credentials not found. Please log in to Claude manually on this server by running "
+                        "'claude auth login' or ensure ~/.claude/.credentials.json exists."
+                    )
+                )
+
         # Check if directory exists, create if needed
         directory_path = Path(options.directory)
         directory_created = False
@@ -408,12 +436,82 @@ class HappyDaemon:
             except Exception as e:
                 return SpawnSessionResult(
                     type="error",
-                    error_message=f"Failed to create directory {options.directory}: {str(e)}",
+                    errorMessage=f"Failed to create directory {options.directory}: {str(e)}",
                 )
 
+        # Create temporary credentials file for the session
+        creds_file_path = None
         try:
-            # Build command for happy-sandbox
-            cmd = [sys.executable, "-m", "happy_sandbox.cli"]
+            creds_file_path = await self._create_tmp_credentials_file()
+            print(f"Created temporary credentials file at: {creds_file_path}")
+        except Exception as e:
+            return SpawnSessionResult(
+                type="error",
+                errorMessage=f"Failed to create credentials file: {str(e)}",
+            )
+
+        try:
+            # Build command to spawn Happy directly (like CLI reference implementation)
+            # The daemon should spawn Happy sessions, not Docker containers
+            cmd = ["uv", "run", "happy-sandbox"]  # Use uv to run happy-sandbox
+            # cmd.extend(["--happy-starting-mode", "remote"])
+            # cmd.extend(["--started-by", "daemon"])
+
+            # Disable daemon in spawned sessions to prevent recursive daemon spawning
+            cmd.extend(["--disable-daemon"])
+
+            # Disable ~/.happy mounting when spawned from daemon - we'll provide credentials.json instead
+            cmd.extend(["--disable-happy-mount"])
+
+            if options.agent == "codex":
+                # For Codex, add appropriate flags if needed
+                pass
+            # For Claude (default), no special flags needed
+
+            print(f"DEBUG: Spawning command: {' '.join(cmd)}")
+            print(f"DEBUG: Working directory: {options.directory}")
+            print(f"DEBUG: Agent: {options.agent}")
+
+            # Validate command exists before attempting to spawn
+            try:
+                # Check if uv is available
+                uv_check = subprocess.run(["which", "uv"], capture_output=True, text=True)
+                if uv_check.returncode != 0:
+                    print(f"ERROR: 'uv' command not found in PATH")
+                    return SpawnSessionResult(
+                        type="error",
+                        errorMessage="'uv' command not found. Please ensure uv is installed and in PATH."
+                    )
+                print(f"DEBUG: Found uv at: {uv_check.stdout.strip()}")
+
+                # Check if happy-sandbox is available via uv run
+                cmd_check = subprocess.run(
+                    ["uv", "run", "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if cmd_check.returncode != 0:
+                    print(f"ERROR: 'uv run' failed with return code {cmd_check.returncode}")
+                    print(f"ERROR: uv run stderr: {cmd_check.stderr}")
+                    return SpawnSessionResult(
+                        type="error",
+                        errorMessage=f"'uv run' command failed: {cmd_check.stderr}"
+                    )
+                print(f"DEBUG: 'uv run' command is available")
+
+            except subprocess.TimeoutExpired:
+                print(f"ERROR: Command validation timed out")
+                return SpawnSessionResult(
+                    type="error",
+                    errorMessage="Command validation timed out"
+                )
+            except Exception as e:
+                print(f"ERROR: Command validation failed: {e}")
+                return SpawnSessionResult(
+                    type="error",
+                    errorMessage=f"Command validation failed: {str(e)}"
+                )
 
             # Set environment variables
             env = os.environ.copy()
@@ -424,30 +522,121 @@ class HappyDaemon:
                 else:  # claude
                     env["CLAUDE_CODE_OAUTH_TOKEN"] = options.token
 
-            # Spawn the process
-            process = subprocess.Popen(
-                cmd,
-                cwd=options.directory,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,  # Detach from parent
-            )
+            # Mount credentials file as a volume (when using Docker)
+            # For now, just pass the credentials file path via environment
+            env["HAPPY_CLIENT_CREDENTIALS_FILE"] = creds_file_path
 
-            if process.pid is None:
+            print(f"DEBUG: Environment variables set:")
+            print(f"DEBUG: - CLAUDE_CODE_OAUTH_TOKEN: {'SET' if env.get('CLAUDE_CODE_OAUTH_TOKEN') else 'NOT SET'}")
+            print(f"DEBUG: - HAPPY_CLIENT_CREDENTIALS_FILE: {env.get('HAPPY_CLIENT_CREDENTIALS_FILE', 'NOT SET')}")
+
+            # Spawn the process with a pseudo-TTY to avoid "input device is not a TTY" error
+            print(f"DEBUG: Creating PTY for process communication")
+            try:
+                master_fd, slave_fd = pty.openpty()
+                print(f"DEBUG: PTY created successfully - master_fd: {master_fd}, slave_fd: {slave_fd}")
+            except Exception as e:
+                print(f"ERROR: Failed to create PTY: {e}")
                 return SpawnSessionResult(
                     type="error",
-                    error_message="Failed to spawn process - no PID returned",
+                    errorMessage=f"Failed to create PTY: {str(e)}"
                 )
 
-            print(f"Spawned process with PID {process.pid}")
+            print(f"DEBUG: Starting subprocess with Popen")
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=options.directory,
+                    env=env,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    start_new_session=True,  # Detach from parent
+                    text=True,  # Ensure text mode for easier handling
+                )
+                print(f"DEBUG: Subprocess started successfully")
+            except Exception as e:
+                print(f"ERROR: Failed to start subprocess: {e}")
+                print(f"ERROR: Command was: {' '.join(cmd)}")
+                print(f"ERROR: Working directory was: {options.directory}")
+                # Clean up PTY resources
+                try:
+                    os.close(master_fd)
+                    os.close(slave_fd)
+                except:
+                    pass
+                return SpawnSessionResult(
+                    type="error",
+                    errorMessage=f"Failed to start subprocess: {str(e)}"
+                )
+
+            # Close slave_fd in parent process (child will use it)
+            print(f"DEBUG: Closing slave_fd {slave_fd} in parent process")
+            try:
+                os.close(slave_fd)
+                print(f"DEBUG: Successfully closed slave_fd")
+            except Exception as e:
+                print(f"ERROR: Failed to close slave_fd: {e}")
+
+            # Convert master_fd to a file-like object for easier handling
+            print(f"DEBUG: Converting master_fd {master_fd} to file object")
+            try:
+                # Use binary mode for PTY compatibility - PTY file descriptors are not seekable
+                # and don't work well with text mode buffering
+                master_file = os.fdopen(master_fd, 'w+b', buffering=0)  # Binary mode, no buffering
+                print(f"DEBUG: Successfully created master_file object")
+            except Exception as e:
+                print(f"ERROR: Failed to create master_file object: {e}")
+                # Clean up resources
+                try:
+                    os.close(master_fd)
+                except:
+                    pass
+                return SpawnSessionResult(
+                    type="error",
+                    errorMessage=f"Failed to create master file object: {str(e)}"
+                )
+
+            if process.pid is None:
+                print(f"ERROR: Process PID is None - process failed to start")
+                try:
+                    master_file.close()
+                except:
+                    pass
+                return SpawnSessionResult(
+                    type="error",
+                    errorMessage="Failed to spawn process - no PID returned",
+                )
+
+            print(f"DEBUG: Spawned process with PID {process.pid}")
+
+            # Check if process is still alive after a brief moment
+            import time
+            time.sleep(0.1)  # Give process a moment to potentially crash
+            poll_result = process.poll()
+            if poll_result is not None:
+                print(f"ERROR: Process {process.pid} exited immediately with code {poll_result}")
+                try:
+                    master_file.close()
+                except:
+                    pass
+                return SpawnSessionResult(
+                    type="error",
+                    errorMessage=f"Process exited immediately with code {poll_result}. Check if happy-sandbox is properly installed."
+                )
+
+            print(f"DEBUG: Process {process.pid} is running successfully")
+
+            # Start async task to forward PTY output to daemon stderr for debugging
+            print(f"DEBUG: Starting PTY output forwarding task for PID {process.pid}")
+            asyncio.create_task(self._forward_pty_output(process.pid, master_file))
 
             # Track the session
             session = TrackedSession(
                 started_by="daemon",
                 pid=process.pid,
                 directory_created=directory_created,
+                credentials_file=creds_file_path,
                 message=(
                     f"The path '{options.directory}' did not exist. We created a new folder and spawned a new session there."
                     if directory_created
@@ -462,13 +651,30 @@ class HappyDaemon:
             session_id = f"session-{process.pid}-{self._current_time_ms()}"
             session.happy_session_id = session_id
 
+            # Start supervising the session for message forwarding
+            if self.session_supervisor:
+                try:
+                    await self.session_supervisor.supervise_session(
+                        session_id=session_id,
+                        claude_session_id=options.session_id,  # May be None initially
+                        directory=options.directory,
+                        pid=process.pid
+                    )
+                    print(f"Started supervising session {session_id}")
+                except Exception as e:
+                    print(f"Warning: Failed to start session supervision: {e}")
+
             return SpawnSessionResult(
-                type="success", session_id=session_id, message=session.message
+                type="success", sessionId=session_id, message=session.message
             )
 
         except Exception as e:
+            print(f"ERROR: Unexpected exception in _spawn_session: {e}")
+            import traceback
+            print(f"ERROR: Full traceback:")
+            traceback.print_exc()
             return SpawnSessionResult(
-                type="error", error_message=f"Failed to spawn session: {str(e)}"
+                type="error", errorMessage=f"Failed to spawn session: {str(e)}"
             )
 
     async def _handle_stop_session(self, params: Dict[str, Any]) -> str:
@@ -477,7 +683,7 @@ class HappyDaemon:
         try:
             session_id = params.get("sessionId", "")
 
-            success = self._stop_session(session_id)
+            success = await self._stop_session(session_id)
             return self._encrypt_response(
                 {
                     "success": success,
@@ -490,7 +696,7 @@ class HappyDaemon:
                 {"success": False, "message": f"Error stopping session: {str(e)}"}
             )
 
-    def _stop_session(self, session_id: str) -> bool:
+    async def _stop_session(self, session_id: str) -> bool:
         """Stop a session by session ID or PID."""
         print(f"Attempting to stop session {session_id}")
 
@@ -501,9 +707,21 @@ class HappyDaemon:
                 and pid == int(session_id.replace("PID-", ""))
             ):
                 try:
+                    # Stop supervising the session
+                    if self.session_supervisor:
+                        await self.session_supervisor.unsupervise_session(session_id)
+
                     # Send SIGTERM to the process
                     os.kill(pid, signal.SIGTERM)
                     print(f"Sent SIGTERM to session {session_id} (PID: {pid})")
+
+                    # Clean up temporary credentials file
+                    if session.credentials_file:
+                        try:
+                            os.unlink(session.credentials_file)
+                            print(f"Cleaned up credentials file: {session.credentials_file}")
+                        except OSError as e:
+                            print(f"Failed to clean up credentials file {session.credentials_file}: {e}")
 
                     # Remove from tracking
                     del self.tracked_sessions[pid]
@@ -513,6 +731,18 @@ class HappyDaemon:
                 except ProcessLookupError:
                     # Process already dead
                     print(f"Process {pid} already dead, removing from tracking")
+                    # Still need to stop supervision
+                    if self.session_supervisor:
+                        await self.session_supervisor.unsupervise_session(session_id)
+
+                    # Clean up temporary credentials file
+                    if session.credentials_file:
+                        try:
+                            os.unlink(session.credentials_file)
+                            print(f"Cleaned up credentials file: {session.credentials_file}")
+                        except OSError as e:
+                            print(f"Failed to clean up credentials file {session.credentials_file}: {e}")
+
                     del self.tracked_sessions[pid]
                     return True
                 except Exception as e:
@@ -575,6 +805,16 @@ class HappyDaemon:
 
         for pid in stale_pids:
             print(f"Removing stale session with PID {pid}")
+            session = self.tracked_sessions[pid]
+
+            # Clean up temporary credentials file
+            if session.credentials_file:
+                try:
+                    os.unlink(session.credentials_file)
+                    print(f"Cleaned up credentials file: {session.credentials_file}")
+                except OSError as e:
+                    print(f"Failed to clean up credentials file {session.credentials_file}: {e}")
+
             del self.tracked_sessions[pid]
 
     async def _heartbeat_loop(self) -> None:
@@ -656,9 +896,221 @@ class HappyDaemon:
             except Exception as e:
                 print(f"Error stopping session {pid}: {e}")
 
+            # Clean up temporary credentials file
+            if session.credentials_file:
+                try:
+                    os.unlink(session.credentials_file)
+                    print(f"Cleaned up credentials file: {session.credentials_file}")
+                except OSError as e:
+                    print(f"Failed to clean up credentials file {session.credentials_file}: {e}")
+
         self.tracked_sessions.clear()
+
+        # Stop session supervisor
+        if self.session_supervisor:
+            await self.session_supervisor.stop()
+            print("Session supervisor stopped")
 
         if self.sio.connected:
             await self.sio.disconnect()
 
         print("Daemon shutdown complete")
+
+    async def _create_tmp_credentials_file(self) -> str:
+        """Create a temporary credentials file for Happy client sessions.
+
+        Returns the path to the temporary file that should be mounted into containers.
+        The file format matches what the Happy CLI's TokenStorage expects.
+        """
+        try:
+            # Create credentials in the format expected by Happy CLI TokenStorage
+            credentials_data = {
+                "token": self.token,
+                "secret": base64.b64encode(self.encryption_key).decode("ascii"),
+                "machine_id": self.machine_id
+            }
+
+            # Create temporary file
+            temp_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json",
+                prefix="happy-credentials-",
+                delete=False  # Keep file around for the session
+            )
+
+            # Write credentials to file
+            json.dump(credentials_data, temp_file, indent=2)
+            temp_file.close()
+
+            # Set restrictive permissions (readable only by owner)
+            os.chmod(temp_file.name, 0o600)
+
+            return temp_file.name
+
+        except Exception as e:
+            raise Exception(f"Failed to create temporary credentials file: {e}")
+
+    async def _forward_process_output(self, pid: int, stream, stream_name: str) -> None:
+        """Forward process stdout/stderr to daemon stderr for debugging."""
+        try:
+            if stream is None:
+                return
+
+            # Run in thread pool to avoid blocking async loop
+            loop = asyncio.get_event_loop()
+
+            def read_stream():
+                lines = []
+                try:
+                    for line in stream:
+                        lines.append(line.rstrip())
+                except Exception:
+                    pass
+                return lines
+
+            # Read all output in thread pool
+            lines = await loop.run_in_executor(None, read_stream)
+
+            # Print all lines to daemon stderr
+            for line in lines:
+                if line:  # Skip empty lines
+                    print(f"[PID {pid} {stream_name}] {line}", file=sys.stderr)
+
+        except Exception as e:
+            print(f"Error forwarding {stream_name} for PID {pid}: {e}", file=sys.stderr)
+        finally:
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+
+    async def _forward_pty_output(self, pid: int, pty_file) -> None:
+        """Forward PTY output to daemon stderr for debugging."""
+        print(f"DEBUG: Starting PTY output forwarding for PID {pid}")
+        try:
+            if pty_file is None:
+                print(f"ERROR: PTY file is None for PID {pid}")
+                return
+
+            # Run in thread pool to avoid blocking async loop
+            loop = asyncio.get_event_loop()
+
+            def read_pty():
+                lines = []
+                buffer = b""  # Use bytes buffer since file is in binary mode
+                try:
+                    print(f"DEBUG: Starting PTY read loop for PID {pid}", file=sys.stderr)
+                    while True:
+                        try:
+                            # Read from PTY in small chunks to avoid blocking
+                            data = pty_file.read(1024)
+                            if not data:
+                                print(f"DEBUG: PTY read returned no data for PID {pid}, exiting", file=sys.stderr)
+                                break
+
+                            print(f"DEBUG: PTY read {len(data)} bytes for PID {pid}", file=sys.stderr)
+                            buffer += data
+
+                            # Process complete lines - decode bytes to string for processing
+                            try:
+                                text_buffer = buffer.decode('utf-8', errors='ignore')
+                                while '\n' in text_buffer:
+                                    line, text_buffer = text_buffer.split('\n', 1)
+                                    if line.strip():  # Skip empty lines
+                                        lines.append(line.rstrip())
+                                        print(f"[PID {pid} PTY] {line.rstrip()}", file=sys.stderr, flush=True)
+
+                                # Convert back to bytes for next iteration
+                                buffer = text_buffer.encode('utf-8')
+
+                            except UnicodeDecodeError:
+                                # If we can't decode, just continue accumulating data
+                                pass
+
+                        except OSError as e:
+                            print(f"DEBUG: PTY OSError for PID {pid}: {e}", file=sys.stderr)
+                            # PTY closed or process died
+                            break
+                        except Exception as e:
+                            print(f"DEBUG: PTY read exception for PID {pid}: {e}", file=sys.stderr)
+                            break
+
+                    # Print any remaining buffer content
+                    try:
+                        final_text = buffer.decode('utf-8', errors='ignore')
+                        if final_text.strip():
+                            lines.append(final_text.rstrip())
+                            print(f"[PID {pid} PTY] {final_text.rstrip()}", file=sys.stderr, flush=True)
+                    except UnicodeDecodeError:
+                        pass
+
+                except Exception as e:
+                    print(f"DEBUG: PTY read outer exception for PID {pid}: {e}", file=sys.stderr)
+
+                print(f"DEBUG: PTY read loop finished for PID {pid}, captured {len(lines)} lines", file=sys.stderr)
+                return lines
+
+            # Read PTY output in thread pool
+            print(f"DEBUG: Submitting PTY read task to thread pool for PID {pid}")
+            lines = await loop.run_in_executor(None, read_pty)
+            print(f"DEBUG: PTY read task completed for PID {pid}, got {len(lines)} lines")
+
+        except Exception as e:
+            print(f"ERROR: Exception in PTY forwarding for PID {pid}: {e}", file=sys.stderr)
+            import traceback
+            print(f"ERROR: PTY forwarding traceback for PID {pid}:", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            try:
+                if pty_file:
+                    print(f"DEBUG: Closing PTY file for PID {pid}")
+                    pty_file.close()
+                    print(f"DEBUG: PTY file closed for PID {pid}")
+            except Exception as e:
+                print(f"ERROR: Exception closing PTY file for PID {pid}: {e}", file=sys.stderr)
+
+    # Session supervision interface methods
+    async def send_claude_session_message(
+        self, session_id: str, message_data: Dict[str, Any]
+    ) -> None:
+        """Send a Claude session message through the supervisor."""
+        if self.session_supervisor:
+            await self.session_supervisor.send_claude_message(session_id, message_data)
+
+    async def send_codex_session_message(
+        self, session_id: str, message_data: Dict[str, Any]
+    ) -> None:
+        """Send a Codex session message through the supervisor."""
+        if self.session_supervisor:
+            await self.session_supervisor.send_codex_message(session_id, message_data)
+
+    async def update_session_thinking_state(
+        self, session_id: str, thinking: bool
+    ) -> None:
+        """Update a session's thinking state."""
+        if self.session_supervisor:
+            await self.session_supervisor.update_session_thinking(session_id, thinking)
+
+    async def update_session_mode_state(self, session_id: str, mode: str) -> None:
+        """Update a session's mode (local/remote)."""
+        if self.session_supervisor:
+            await self.session_supervisor.update_session_mode(session_id, mode)
+
+    async def update_session_claude_id(
+        self, session_id: str, claude_session_id: str
+    ) -> None:
+        """Update a session's Claude session ID."""
+        if self.session_supervisor:
+            await self.session_supervisor.update_session_claude_id(
+                session_id, claude_session_id
+            )
+
+    def get_supervised_sessions(self) -> Dict[str, Any]:
+        """Get information about all supervised sessions."""
+        if self.session_supervisor:
+            return {
+                sid: session.model_dump()
+                for sid, session in self.session_supervisor.get_supervised_sessions().items()
+            }
+        return {}
